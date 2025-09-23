@@ -13,7 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional
 import time
 
-from face_recognition_handler import FaceRecognitionHandler
+# Prefer the compatible handler which falls back to OpenCV when face_recognition/dlib
+# are not available in the current Python environment.
+from face_recognition_handler_compatible import FaceRecognitionHandler
 from camera_handler import CameraHandler
 
 
@@ -179,6 +181,15 @@ class FacialRecognitionServer:
             
         elif message_type == "list_known_faces":
             return self._handle_list_known_faces()
+
+        elif message_type == "train_model":
+            return self._handle_train_model()
+
+        elif message_type == "clear_model":
+            return self._handle_clear_model()
+
+        elif message_type == "predict":
+            return self._handle_predict()
             
         elif message_type == "ping":
             return {
@@ -304,6 +315,77 @@ class FacialRecognitionServer:
             return {
                 "type": "error",
                 "message": f"Erro ao listar faces: {str(e)}",
+                "timestamp": time.time()
+            }
+
+    def _handle_train_model(self) -> Dict[str, Any]:
+        """Treina o modelo (LBPH no modo compatível)."""
+        try:
+            success = False
+            if hasattr(self.face_handler, 'train_model'):
+                success = self.face_handler.train_model()
+            return {
+                "type": "model_trained",
+                "success": bool(success),
+                "known_faces": self.face_handler.get_known_faces_list(),
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            self.logger.error(f"Erro ao treinar modelo: {e}")
+            return {
+                "type": "error",
+                "message": f"Erro ao treinar modelo: {str(e)}",
+                "timestamp": time.time()
+            }
+
+    def _handle_clear_model(self) -> Dict[str, Any]:
+        """Limpa dataset/modelo e zera faces conhecidas."""
+        try:
+            success = self.face_handler.clear_all_faces()
+            return {
+                "type": "model_cleared",
+                "success": bool(success),
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            self.logger.error(f"Erro ao limpar modelo: {e}")
+            return {
+                "type": "error",
+                "message": f"Erro ao limpar modelo: {str(e)}",
+                "timestamp": time.time()
+            }
+
+    def _handle_predict(self) -> Dict[str, Any]:
+        """Executa predição (equivalente a reconhecer usando handler.predict)."""
+        try:
+            frame = self.camera_handler.capture_frame()
+            if frame is None:
+                return {
+                    "type": "error",
+                    "message": "Falha ao capturar imagem da câmera",
+                    "timestamp": time.time()
+                }
+
+            if hasattr(self.face_handler, 'predict'):
+                result = self.face_handler.predict(frame)
+            else:
+                result = self.face_handler.recognize_faces(frame)
+
+            _, buffer = self.camera_handler.encode_frame(frame)
+            image_data = base64.b64encode(buffer).decode('utf-8')
+
+            return {
+                "type": "prediction_result",
+                "recognized_faces": result.get("faces", []),
+                "confidence_scores": result.get("confidence", []),
+                "image_data": image_data,
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            self.logger.error(f"Erro na predição: {e}")
+            return {
+                "type": "error",
+                "message": f"Erro na predição: {str(e)}",
                 "timestamp": time.time()
             }
             

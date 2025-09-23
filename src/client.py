@@ -144,6 +144,28 @@ class FacialRecognitionClient:
             
         elif message_type == "known_faces_list":
             self._handle_faces_list(message)
+
+        elif message_type == "model_trained":
+            ok = message.get('success', False)
+            print(f"\n🛠️ Treino de modelo: {'✅ OK' if ok else '❌ Falhou'}")
+            faces = message.get('known_faces', [])
+            if faces:
+                print("   👥 Pessoas no modelo:")
+                for i, n in enumerate(faces, 1):
+                    print(f"   {i}. {n}")
+
+        elif message_type == "model_cleared":
+            ok = message.get('success', False)
+            print(f"\n🧹 Limpar modelo: {'✅ OK' if ok else '❌ Falhou'}")
+
+        elif message_type == "prediction_result":
+            self._handle_recognition_result({
+                'type': 'recognition_result',
+                'recognized_faces': message.get('recognized_faces', []),
+                'confidence_scores': message.get('confidence_scores', []),
+                'image_data': message.get('image_data'),
+                'timestamp': message.get('timestamp')
+            })
             
         elif message_type == "pong":
             print(f"\n🏓 Pong recebido - Latência: {time.time() - message.get('timestamp', 0):.3f}s")
@@ -311,10 +333,13 @@ class FacialRecognitionClient:
             print("3. ➕ Adicionar face conhecida")
             print("4. 👥 Listar faces conhecidas")
             print("5. 🏓 Ping")
-            print("6. 🚪 Sair")
+            print("6. 🛠️ Treinar modelo (LBPH)")
+            print("7. 🤖 Predict (LBPH)")
+            print("8. 🧹 Limpar modelo")
+            print("9. � Sair")
             
             try:
-                choice = input("\n👆 Escolha uma opção (1-6): ").strip()
+                choice = input("\n👆 Escolha uma opção (1-9): ").strip()
                 
                 if choice == "1":
                     self.request_face_recognition()
@@ -340,6 +365,18 @@ class FacialRecognitionClient:
                     self.send_ping()
                     
                 elif choice == "6":
+                    self.send_message({"type": "train_model", "timestamp": time.time()})
+                    print("🛠️ Treinando modelo...")
+
+                elif choice == "7":
+                    self.send_message({"type": "predict", "timestamp": time.time()})
+                    print("🤖 Solicitando predição...")
+
+                elif choice == "8":
+                    self.send_message({"type": "clear_model", "timestamp": time.time()})
+                    print("🧹 Limpando modelo/dataset...")
+
+                elif choice == "9":
                     print("👋 Encerrando cliente...")
                     break
                     

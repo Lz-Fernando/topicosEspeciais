@@ -278,6 +278,40 @@ Se você encontrar problemas:
 3. **📖 Consulte a documentação** neste README
 4. **🐛 Abra uma issue** descrevendo o problema
 
+### 🪟 Windows: erro ao instalar dlib (CMake não encontrado)
+
+Se ao executar `pip install -r requirements.txt` você recebeu erro semelhante a:
+
+"CMake is not installed on your system" ao construir `dlib`, mesmo após instalar o CMake, é porque:
+
+- O shell atual não encontra o executável do CMake no PATH; ou
+- Você está usando Python 3.13, para o qual ainda não há wheels pré-compilados de `dlib`/`face_recognition`, exigindo toolchain C++ completo para compilar; ou
+- Existe uma cópia quebrada do CMake (por exemplo, instalada por outro gerenciador) que entra em conflito.
+
+Como resolver:
+
+Opção A) Instalar toolchain C++ e CMake corretamente (para compilar dlib)
+- Instale o CMake oficial e marque "Add CMake to system PATH" durante a instalação.
+- Instale o Visual Studio Build Tools (ou Visual Studio) com os componentes:
+    - "Desktop development with C++"
+    - MSVC v14.x, Windows 10/11 SDK, C++ CMake tools for Windows
+- Abra um novo PowerShell e valide:
+    - `cmake --version` deve funcionar
+    - `cl` deve estar disponível quando você executar o Developer PowerShell do VS
+- Tente novamente a instalação:
+    - `pip install dlib==19.24.4` (versão recente conhecida). Em Python 3.13 pode falhar dependendo do suporte.
+
+Opção B) Usar modo compatível sem dlib (recomendado para Python 3.13)
+- Instale dependências mínimas:
+    - `pip install -r requirements-lite.txt`
+- O servidor já foi configurado para usar `face_recognition_handler_compatible`, que faz fallback para OpenCV quando `face_recognition`/`dlib` não estão disponíveis.
+- Você terá detecção de faces via OpenCV (sem embeddings/recognition robusto), suficiente para testes de câmera e fluxo cliente-servidor.
+
+Dicas rápidas de diagnóstico:
+- No mesmo terminal, rode `cmake --version`. Se não funcionar, o PATH não está configurado.
+- Verifique qual Python está ativo: `python -c "import sys; print(sys.version); print(sys.executable)"`.
+- Preferencialmente use Python 3.10/3.11 para `dlib`/`face_recognition` hoje. No Windows, o Windows Store Python e o Launcher `py` podem ajudar a ter múltiplas versões.
+
 ## 📞 Contato
 
 - **Desenvolvedor**: João Pedro
