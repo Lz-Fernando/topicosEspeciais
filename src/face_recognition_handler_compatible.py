@@ -21,14 +21,13 @@ from PIL import Image
 import io
 import json
 import time
-import os
-from dotenv import load_dotenv
+from config import MODELS_DIR, DATA_DIR, LBPH_THRESHOLD
 
 
 class FaceRecognitionHandler:
     """Gerencia o reconhecimento facial e faces conhecidas."""
     
-    def __init__(self, models_dir: str = "models", tolerance: float = 0.6):
+    def __init__(self, models_dir: str = MODELS_DIR, tolerance: float = 0.6):
         """
         Inicializa o handler de reconhecimento facial.
         
@@ -36,19 +35,8 @@ class FaceRecognitionHandler:
             models_dir: Diretório para armazenar modelos
             tolerance: Tolerância para reconhecimento (menor = mais restritivo)
         """
-        # Carrega .env (se existir)
-        try:
-            load_dotenv()
-        except Exception:
-            pass
-
         self.models_dir = models_dir
         self.tolerance = tolerance
-        # Threshold do LBPH: menor = mais restritivo. Padrão 70.
-        try:
-            self.lbph_threshold: float = float(os.getenv("LBPH_THRESHOLD", "70"))
-        except Exception:
-            self.lbph_threshold = 70.0
         
         # Configuração de logging
         self.logger = logging.getLogger(__name__)
@@ -79,9 +67,10 @@ class FaceRecognitionHandler:
         self.faces_database_file = os.path.join(self.models_dir, "opencv_faces.pkl")
 
         # Caminhos para treinamento e modelo LBPH
-        self.training_data_dir = os.path.join("data")
+        self.training_data_dir = os.path.join(DATA_DIR)
         self.lbph_model_file = os.path.join(self.models_dir, "opencv_lbph.xml")
         self.lbph_labels_file = os.path.join(self.models_dir, "lbph_labels.json")
+        self.lbph_threshold = LBPH_THRESHOLD
         self.label_to_name: Dict[int, str] = {}
         self.name_to_label: Dict[str, int] = {}
         self.recognizer = None
@@ -433,8 +422,8 @@ class FaceRecognitionHandler:
                     face_roi = frame[y:y+h, x:x+w]
                     gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
                     label, confidence = self.recognizer.predict(gray)
-                    # Menor 'confidence' => melhor; usa limiar configurável
-                    threshold = float(getattr(self, 'lbph_threshold', 70.0))
+                    # Menor 'confidence' => melhor; limiar empírico
+                    threshold = getattr(self, 'lbph_threshold', 70.0)
                     if confidence <= threshold and label in self.label_to_name:
                         name = self.label_to_name[label]
                         score = max(0.0, 1.0 - (confidence/100.0))

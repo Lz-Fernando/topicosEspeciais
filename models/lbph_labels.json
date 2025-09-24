@@ -1,0 +1,10 @@
+{
+  "label_to_name": {
+    "0": "fernando",
+    "1": "fernando 2"
+  },
+  "name_to_label": {
+    "fernando": 0,
+    "fernando 2": 1
+  }
+}

@@ -12,17 +12,27 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional
 import time
+import argparse
+import os
 
-# Prefer the compatible handler which falls back to OpenCV when face_recognition/dlib
-# are not available in the current Python environment.
-from face_recognition_handler_compatible import FaceRecognitionHandler
 from camera_handler import CameraHandler
+from face_recognition_handler_compatible import FaceRecognitionHandler
+from config import (
+    SERVER_HOST,
+    SERVER_PORT,
+    MAX_WORKERS,
+    LOG_DIR,
+    DATA_DIR,
+    CAMERA_INDEX,
+    camera_resolution,
+)
 
 
 class FacialRecognitionServer:
     """Servidor principal para reconhecimento facial com suporte a múltiplos clientes."""
     
-    def __init__(self, host: str = 'localhost', port: int = 8888, max_workers: int = 5):
+    def __init__(self, host: str = 'localhost', port: int = 8888, max_workers: int = 5,
+                 camera_index: int = CAMERA_INDEX, resolution: tuple = None):
         """
         Inicializa o servidor.
         
@@ -40,7 +50,9 @@ class FacialRecognitionServer:
         
         # Handlers especializados
         self.face_handler = FaceRecognitionHandler()
-        self.camera_handler = CameraHandler()
+        if resolution is None:
+            resolution = camera_resolution()
+        self.camera_handler = CameraHandler(camera_index=camera_index, resolution=resolution)
         
         # Controle de conexões ativas
         self.active_connections: Dict[str, socket.socket] = {}
@@ -51,11 +63,17 @@ class FacialRecognitionServer:
         
     def _setup_logging(self) -> None:
         """Configura o sistema de logging."""
+        # Garante diretório de logs
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+        except Exception:
+            pass
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('server.log'),
+                logging.FileHandler(os.path.join(LOG_DIR, 'server.log')),
                 logging.StreamHandler()
             ]
         )
@@ -78,7 +96,12 @@ class FacialRecognitionServer:
             self.logger.info(f"ThreadPool configurado com {self.max_workers} workers")
             
             # Inicializa handlers
-            self.camera_handler.initialize_camera()
+            ok = self.camera_handler.initialize_camera()
+            if not ok:
+                self.logger.error("Falha ao inicializar a câmera. Verifique:")
+                self.logger.error("1) Se outra aplicação está usando a webcam")
+                self.logger.error("2) Configurações do Windows: Privacidade e segurança > Câmera > Permitir acesso para aplicativos desktop")
+                self.logger.error("3) Teste a webcam no aplicativo Câmera do Windows")
             self.face_handler.load_known_faces()
             
             # Loop principal de aceitação de conexões
@@ -127,29 +150,36 @@ class FacialRecognitionServer:
             }
             self._send_message(client_socket, welcome_msg)
             
-            # Loop de comunicação com o cliente
+            # Loop de comunicação com o cliente (bufferizado por linhas)
+            recv_buffer = b""
             while self.is_running:
                 try:
                     # Recebe dados do cliente
                     data = client_socket.recv(4096)
                     if not data:
                         break
-                        
-                    # Processa a mensagem
-                    message = json.loads(data.decode('utf-8'))
-                    response = self._process_client_message(message)
-                    
-                    # Envia resposta
-                    self._send_message(client_socket, response)
-                    
-                except json.JSONDecodeError:
-                    error_response = {
-                        "type": "error",
-                        "message": "Formato de mensagem inválido",
-                        "timestamp": time.time()
-                    }
-                    self._send_message(client_socket, error_response)
-                    
+
+                    recv_buffer += data
+
+                    # Processa todas as mensagens completas (terminadas com \n)
+                    while b"\n" in recv_buffer:
+                        line, recv_buffer = recv_buffer.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        try:
+                            message = json.loads(line.decode('utf-8'))
+                        except json.JSONDecodeError:
+                            error_response = {
+                                "type": "error",
+                                "message": "Formato de mensagem inválido",
+                                "timestamp": time.time()
+                            }
+                            self._send_message(client_socket, error_response)
+                            continue
+
+                        response = self._process_client_message(message)
+                        self._send_message(client_socket, response)
+
                 except socket.timeout:
                     continue
                     
@@ -191,6 +221,9 @@ class FacialRecognitionServer:
         elif message_type == "predict":
             return self._handle_predict()
             
+        elif message_type == "collect_dataset":
+            return self._handle_collect_dataset(message)
+
         elif message_type == "ping":
             return {
                 "type": "pong",
@@ -266,6 +299,45 @@ class FacialRecognitionServer:
                 "timestamp": time.time()
             }
             
+    def _handle_collect_dataset(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Coleta N imagens via câmera para o dataset data/<name>/ usando o fluxo de add_known_face."""
+        try:
+            name = message.get("name")
+            count = int(message.get("count", 20))
+            if not name or count <= 0:
+                return {"type": "error", "message": "Parâmetros inválidos para coleta de dataset", "timestamp": time.time()}
+
+            saved = 0
+            attempts = 0
+            max_attempts = count * 3  # tolera algumas falhas de detecção
+
+            while saved < count and attempts < max_attempts:
+                attempts += 1
+                frame = self.camera_handler.capture_frame()
+                if frame is None:
+                    time.sleep(0.05)
+                    continue
+                # Reaproveita pipeline existente: encode -> base64 -> add_known_face
+                ok, buf = self.camera_handler.encode_frame(frame)
+                if not ok:
+                    continue
+                b64 = base64.b64encode(buf).decode('utf-8')
+                if self.face_handler.add_known_face(name, b64):
+                    saved += 1
+                    time.sleep(0.2)
+
+            return {
+                "type": "dataset_collected",
+                "success": saved > 0,
+                "requested": count,
+                "saved": saved,
+                "name": name,
+                "timestamp": time.time()
+            }
+        except Exception as e:
+            self.logger.error(f"Erro na coleta de dataset: {e}")
+            return {"type": "error", "message": f"Erro na coleta: {str(e)}", "timestamp": time.time()}
+
     def _handle_add_known_face(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Adiciona nova face conhecida."""
         try:
@@ -324,10 +396,13 @@ class FacialRecognitionServer:
             success = False
             if hasattr(self.face_handler, 'train_model'):
                 success = self.face_handler.train_model()
+            dataset_counts, total_images = self._dataset_counts()
             return {
                 "type": "model_trained",
                 "success": bool(success),
                 "known_faces": self.face_handler.get_known_faces_list(),
+                "dataset_counts": dataset_counts,
+                "total_images": total_images,
                 "timestamp": time.time()
             }
         except Exception as e:
@@ -392,8 +467,8 @@ class FacialRecognitionServer:
     def _send_message(self, client_socket: socket.socket, message: Dict[str, Any]) -> None:
         """Envia mensagem para o cliente."""
         try:
-            data = json.dumps(message).encode('utf-8')
-            client_socket.send(data)
+            data = json.dumps(message).encode('utf-8') + b"\n"
+            client_socket.sendall(data)
         except Exception as e:
             self.logger.error(f"Erro ao enviar mensagem: {e}")
             
@@ -422,6 +497,28 @@ class FacialRecognitionServer:
                 "is_running": self.is_running,
                 "connected_clients": list(self.active_connections.keys())
             }
+
+    def _dataset_counts(self) -> tuple[Dict[str, int], int]:
+        """Conta imagens por pessoa no diretório de dataset."""
+        counts: Dict[str, int] = {}
+        total = 0
+        try:
+            if os.path.isdir(DATA_DIR):
+                for name in os.listdir(DATA_DIR):
+                    person_dir = os.path.join(DATA_DIR, name)
+                    if not os.path.isdir(person_dir):
+                        continue
+                    c = 0
+                    for f in os.listdir(person_dir):
+                        lf = f.lower()
+                        if lf.endswith('.jpg') or lf.endswith('.jpeg') or lf.endswith('.png'):
+                            c += 1
+                    if c > 0:
+                        counts[name] = c
+                        total += c
+        except Exception as e:
+            self.logger.error(f"Erro ao contar dataset: {e}")
+        return counts, total
             
     def shutdown(self) -> None:
         """Encerra o servidor de forma segura."""
@@ -456,7 +553,15 @@ class FacialRecognitionServer:
 
 def main():
     """Função principal para executar o servidor."""
-    server = FacialRecognitionServer(host='localhost', port=8888, max_workers=5)
+    parser = argparse.ArgumentParser(description="Servidor de reconhecimento facial")
+    parser.add_argument("--host", default=SERVER_HOST, help=f"Endereço do servidor (default: {SERVER_HOST})")
+    parser.add_argument("--port", type=int, default=SERVER_PORT, help=f"Porta do servidor (default: {SERVER_PORT})")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help=f"Quantidade de workers no ThreadPool (default: {MAX_WORKERS})")
+    parser.add_argument("--camera-index", type=int, default=CAMERA_INDEX, help=f"Índice da câmera (default: {CAMERA_INDEX})")
+    args = parser.parse_args()
+
+    server = FacialRecognitionServer(host=args.host, port=args.port, max_workers=args.workers,
+                                     camera_index=args.camera_index, resolution=camera_resolution())
     
     try:
         server.start_server()

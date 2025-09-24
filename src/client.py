@@ -12,6 +12,9 @@ import logging
 import base64
 from typing import Dict, Any, Optional
 import os
+import argparse
+import os
+from config import SERVER_HOST, SERVER_PORT, LOG_DIR
 
 
 class FacialRecognitionClient:
@@ -39,11 +42,17 @@ class FacialRecognitionClient:
         
     def _setup_logging(self) -> None:
         """Configura o sistema de logging."""
+        # Garante diretório de logs
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+        except Exception:
+            pass
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('client.log'),
+                logging.FileHandler(os.path.join(LOG_DIR, 'client.log')),
                 logging.StreamHandler()
             ]
         )
@@ -95,25 +104,32 @@ class FacialRecognitionClient:
         
     def _receive_messages(self) -> None:
         """Thread para receber mensagens do servidor."""
+        recv_buffer = b""
         while not self.stop_receiving.is_set() and self.is_connected:
             try:
                 if not self.socket:
                     break
-                    
-                # Recebe dados do servidor
+
                 data = self.socket.recv(4096)
                 if not data:
                     self.logger.warning("Conexão fechada pelo servidor")
                     break
-                    
-                # Processa mensagem
-                message = json.loads(data.decode('utf-8'))
-                self._handle_server_message(message)
-                
+
+                recv_buffer += data
+
+                # Processa todas as mensagens completas (terminadas com \n)
+                while b"\n" in recv_buffer:
+                    line, recv_buffer = recv_buffer.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line.decode('utf-8'))
+                        self._handle_server_message(message)
+                    except json.JSONDecodeError as e:
+                        self.logger.error(f"Erro ao decodificar mensagem: {e}")
+                        continue
             except socket.timeout:
                 continue
-            except json.JSONDecodeError as e:
-                self.logger.error(f"Erro ao decodificar mensagem: {e}")
             except Exception as e:
                 if self.is_connected:
                     self.logger.error(f"Erro ao receber mensagem: {e}")
@@ -149,29 +165,27 @@ class FacialRecognitionClient:
             ok = message.get('success', False)
             print(f"\n🛠️ Treino de modelo: {'✅ OK' if ok else '❌ Falhou'}")
             faces = message.get('known_faces', [])
+            dataset_counts = message.get('dataset_counts', {})
+            total_images = message.get('total_images', 0)
             if faces:
                 print("   👥 Pessoas no modelo:")
                 for i, n in enumerate(faces, 1):
-                    print(f"   {i}. {n}")
-
-        elif message_type == "model_cleared":
-            ok = message.get('success', False)
-            print(f"\n🧹 Limpar modelo: {'✅ OK' if ok else '❌ Falhou'}")
-
-        elif message_type == "prediction_result":
-            self._handle_recognition_result({
-                'type': 'recognition_result',
-                'recognized_faces': message.get('recognized_faces', []),
-                'confidence_scores': message.get('confidence_scores', []),
-                'image_data': message.get('image_data'),
-                'timestamp': message.get('timestamp')
-            })
+                    count = dataset_counts.get(n, 0)
+                    print(f"   {i}. {n}  (📷 {count} imagens)")
+            if total_images:
+                print(f"   🗂️ Total de imagens no dataset: {total_images}")
             
         elif message_type == "pong":
             print(f"\n🏓 Pong recebido - Latência: {time.time() - message.get('timestamp', 0):.3f}s")
             
         elif message_type == "error":
             print(f"\n❌ Erro: {message.get('message', 'Erro desconhecido')}")
+
+        elif message_type == "dataset_collected":
+            saved = message.get('saved', 0)
+            requested = message.get('requested', 0)
+            name = message.get('name', '')
+            print(f"\n📥 Coleta de dataset para '{name}': {saved}/{requested} imagens salvas")
             
         else:
             print(f"\n📨 Mensagem recebida: {message}")
@@ -242,8 +256,8 @@ class FacialRecognitionClient:
             return False
             
         try:
-            data = json.dumps(message).encode('utf-8')
-            self.socket.send(data)
+            data = json.dumps(message).encode('utf-8') + b"\n"
+            self.socket.sendall(data)
             return True
             
         except Exception as e:
@@ -333,10 +347,10 @@ class FacialRecognitionClient:
             print("3. ➕ Adicionar face conhecida")
             print("4. 👥 Listar faces conhecidas")
             print("5. 🏓 Ping")
-            print("6. 🛠️ Treinar modelo (LBPH)")
+            print("6. �️ Treinar modelo (LBPH)")
             print("7. 🤖 Predict (LBPH)")
             print("8. 🧹 Limpar modelo")
-            print("9. � Sair")
+            print("9. �🚪 Sair")
             
             try:
                 choice = input("\n👆 Escolha uma opção (1-9): ").strip()
@@ -351,10 +365,24 @@ class FacialRecognitionClient:
                     name = input("👤 Nome da pessoa: ").strip()
                     if name:
                         image_path = input("📁 Caminho da imagem: ").strip()
-                        if os.path.exists(image_path):
-                            self.add_known_face_from_file(name, image_path)
+                        if not os.path.exists(image_path):
+                            print("❌ Caminho não encontrado")
+                        elif os.path.isdir(image_path):
+                            # Coleta automática de N imagens da câmera
+                            try:
+                                cnt_str = input("📷 Quantas imagens coletar da câmera? (padrão 20): ").strip() or "20"
+                                count = int(cnt_str)
+                            except Exception:
+                                count = 20
+                            self.send_message({
+                                "type": "collect_dataset",
+                                "name": name,
+                                "count": count,
+                                "timestamp": time.time()
+                            })
+                            print(f"📥 Coletando {count} imagens para '{name}'... Olhe para a câmera.")
                         else:
-                            print("❌ Arquivo não encontrado")
+                            self.add_known_face_from_file(name, image_path)
                     else:
                         print("❌ Nome não pode estar vazio")
                         
@@ -395,7 +423,12 @@ class FacialRecognitionClient:
 
 def main():
     """Função principal do cliente."""
-    client = FacialRecognitionClient()
+    parser = argparse.ArgumentParser(description="Cliente do servidor de reconhecimento facial")
+    parser.add_argument("--host", default=SERVER_HOST, help=f"Endereço do servidor (default: {SERVER_HOST})")
+    parser.add_argument("--port", type=int, default=SERVER_PORT, help=f"Porta do servidor (default: {SERVER_PORT})")
+    args = parser.parse_args()
+
+    client = FacialRecognitionClient(host=args.host, port=args.port)
     
     try:
         # Conecta ao servidor
