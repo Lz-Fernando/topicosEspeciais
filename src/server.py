@@ -25,6 +25,7 @@ from config import (
     DATA_DIR,
     CAMERA_INDEX,
     camera_resolution,
+    LBPH_THRESHOLD,
 )
 
 
@@ -203,8 +204,7 @@ class FacialRecognitionServer:
         if message_type == "recognize_face":
             return self._handle_face_recognition()
             
-        elif message_type == "capture_image":
-            return self._handle_image_capture()
+        # 'capture_image' removido conforme nova UX
             
         elif message_type == "add_known_face":
             return self._handle_add_known_face(message)
@@ -223,6 +223,9 @@ class FacialRecognitionServer:
             
         elif message_type == "collect_dataset":
             return self._handle_collect_dataset(message)
+
+        elif message_type == "authorize_access":
+            return self._handle_authorize_access(message)
 
         elif message_type == "ping":
             return {
@@ -272,32 +275,7 @@ class FacialRecognitionServer:
                 "timestamp": time.time()
             }
             
-    def _handle_image_capture(self) -> Dict[str, Any]:
-        """Captura uma imagem da câmera."""
-        try:
-            frame = self.camera_handler.capture_frame()
-            if frame is None:
-                return {
-                    "type": "error",
-                    "message": "Falha ao capturar imagem",
-                    "timestamp": time.time()
-                }
-                
-            _, buffer = self.camera_handler.encode_frame(frame)
-            image_data = base64.b64encode(buffer).decode('utf-8')
-            
-            return {
-                "type": "image_captured",
-                "image_data": image_data,
-                "timestamp": time.time()
-            }
-            
-        except Exception as e:
-            return {
-                "type": "error",
-                "message": f"Erro na captura: {str(e)}",
-                "timestamp": time.time()
-            }
+    # _handle_image_capture removido conforme nova UX
             
     def _handle_collect_dataset(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Coleta N imagens via câmera para o dataset data/<name>/ usando o fluxo de add_known_face."""
@@ -461,6 +439,96 @@ class FacialRecognitionServer:
             return {
                 "type": "error",
                 "message": f"Erro na predição: {str(e)}",
+                "timestamp": time.time()
+            }
+
+    def _handle_authorize_access(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Realiza votação em janela deslizante: exige 'required' acertos em 'count' frames.
+
+        Parâmetros (com defaults):
+          - count: número de frames a capturar (default 3)
+          - required: votos necessários para conceder acesso (default 2)
+          - threshold: limiar LBPH para aceitar predição (default LBPH_THRESHOLD)
+        """
+        try:
+            count = int(message.get("count", 3))
+            required = int(message.get("required", 2))
+            threshold = float(message.get("threshold", LBPH_THRESHOLD))
+            if count <= 0 or required <= 0 or required > count:
+                return {"type": "error", "message": "Parâmetros inválidos (count/required)", "timestamp": time.time()}
+
+            tallies: Dict[str, int] = {}
+            frames_details = []
+            last_image_b64 = None
+
+            for i in range(count):
+                frame = self.camera_handler.capture_frame()
+                if frame is None:
+                    frames_details.append({"error": "Falha captura"})
+                    time.sleep(0.1)
+                    continue
+
+                # Executa predição
+                if hasattr(self.face_handler, 'predict'):
+                    result = self.face_handler.predict(frame)
+                else:
+                    result = self.face_handler.recognize_faces(frame)
+
+                faces = result.get("faces", [])
+                confs = result.get("confidence", [])
+                accepted_this_frame = []
+
+                # Considera apenas rótulos conhecidos com confiança abaixo do limiar
+                for idx, name in enumerate(faces):
+                    if not name or name == "Desconhecido":
+                        continue
+                    conf = None
+                    if idx < len(confs):
+                        try:
+                            conf = float(confs[idx])
+                        except Exception:
+                            conf = None
+                    if conf is not None and conf <= threshold:
+                        tallies[name] = tallies.get(name, 0) + 1
+                        accepted_this_frame.append({"name": name, "confidence": conf})
+
+                # Codifica último frame para retorno
+                _, buffer = self.camera_handler.encode_frame(frame)
+                last_image_b64 = base64.b64encode(buffer).decode('utf-8')
+
+                frames_details.append({
+                    "faces": faces,
+                    "confidences": confs,
+                    "accepted": accepted_this_frame,
+                })
+
+                time.sleep(0.15)
+
+            # Decide vencedor
+            winner = None
+            votes = 0
+            if tallies:
+                winner, votes = max(tallies.items(), key=lambda kv: kv[1])
+            granted = bool(winner and votes >= required)
+
+            return {
+                "type": "access_decision",
+                "granted": granted,
+                "name": winner,
+                "votes": votes,
+                "required": required,
+                "count": count,
+                "threshold": threshold,
+                "tallies": tallies,
+                "frames": frames_details,
+                "image_data": last_image_b64,
+                "timestamp": time.time(),
+            }
+        except Exception as e:
+            self.logger.error(f"Erro em authorize_access: {e}")
+            return {
+                "type": "error",
+                "message": f"Erro em authorize_access: {str(e)}",
                 "timestamp": time.time()
             }
             

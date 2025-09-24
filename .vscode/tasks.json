@@ -191,6 +191,17 @@
 			],
 			"isBackground": false,
 			"group": "test"
+		},
+		{
+			"label": "🧪 Validação rápida do cliente (help)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"src/client.py",
+				"--help"
+			],
+			"isBackground": false,
+			"group": "test"
 		}
 	]
 }
