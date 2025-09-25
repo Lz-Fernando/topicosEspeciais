@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """
 Servidor de Reconhecimento Facial
-Implementa arquitetura cliente-servidor com ThreadPool para conexões simultâneas.
+
+Visão geral (o que este arquivo faz):
+- Expõe um servidor TCP que aceita múltiplos clientes simultâneos usando ThreadPoolExecutor.
+- Cada cliente envia e recebe mensagens JSON delimitadas por nova linha ("\n").
+- Faz captura de frames da câmera local e delega reconhecimento/treino ao handler facial.
+
+Como o protocolo funciona:
+- O cliente envia objetos JSON 1-por-linha. Ex.: {"type": "predict"}\n
+- O servidor lê do socket, acumula no buffer até encontrar "\n", faz json.loads e roteia.
+- A resposta é sempre um JSON único terminado por "\n" também.
+
+Handlers usados:
+- CameraHandler: encapsula acesso à webcam (OpenCV) e codificação de frames.
+- FaceRecognitionHandler (compatível): usa OpenCV (LBPH) quando não há dlib/face_recognition.
+
+Por que LBPH?:
+- LBPH (Local Binary Patterns Histograms) é suportado por opencv-contrib e funciona bem em tempo real,
+  especialmente em ambientes sem GPU/dlib. Sua métrica de confiança é "distância": quanto MENOR, melhor.
 """
 
 import socket
@@ -84,6 +101,7 @@ class FacialRecognitionServer:
         """Inicia o servidor e aceita conexões."""
         try:
             # Configuração do socket
+            # AF_INET: IPv4 | SOCK_STREAM: TCP
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
@@ -97,12 +115,14 @@ class FacialRecognitionServer:
             self.logger.info(f"ThreadPool configurado com {self.max_workers} workers")
             
             # Inicializa handlers
+            # Câmera: tenta abrir a webcam e setar resolução/buffer
             ok = self.camera_handler.initialize_camera()
             if not ok:
                 self.logger.error("Falha ao inicializar a câmera. Verifique:")
                 self.logger.error("1) Se outra aplicação está usando a webcam")
                 self.logger.error("2) Configurações do Windows: Privacidade e segurança > Câmera > Permitir acesso para aplicativos desktop")
                 self.logger.error("3) Teste a webcam no aplicativo Câmera do Windows")
+            # Faces: carrega base/modelos persistidos (se houver)
             self.face_handler.load_known_faces()
             
             # Loop principal de aceitação de conexões
@@ -163,6 +183,8 @@ class FacialRecognitionServer:
                     recv_buffer += data
 
                     # Processa todas as mensagens completas (terminadas com \n)
+                    # Importante: o TCP é um stream; uma leitura pode conter múltiplas mensagens ou mensagens parciais.
+                    # Por isso, acumulamos no buffer e dividimos por "\n".
                     while b"\n" in recv_buffer:
                         line, recv_buffer = recv_buffer.split(b"\n", 1)
                         if not line.strip():
@@ -199,7 +221,7 @@ class FacialRecognitionServer:
         Returns:
             Resposta para o cliente
         """
-        message_type = message.get("type", "unknown")
+        message_type = message.get("type", "unknown")  # roteamento por tipo
         
         if message_type == "recognize_face":
             return self._handle_face_recognition()
@@ -253,6 +275,7 @@ class FacialRecognitionServer:
                 }
                 
             # Executa reconhecimento
+            # Nota: com LBPH treinado → prediz identidade; sem LBPH → somente detecção
             result = self.face_handler.recognize_faces(frame)
             
             # Codifica imagem para envio (opcional)
@@ -287,7 +310,7 @@ class FacialRecognitionServer:
 
             saved = 0
             attempts = 0
-            max_attempts = count * 3  # tolera algumas falhas de detecção
+            max_attempts = count * 3  # tolera algumas falhas de detecção (sem travar o fluxo)
 
             while saved < count and attempts < max_attempts:
                 attempts += 1
@@ -296,6 +319,7 @@ class FacialRecognitionServer:
                     time.sleep(0.05)
                     continue
                 # Reaproveita pipeline existente: encode -> base64 -> add_known_face
+                # Isso mantém o mesmo caminho de código que o envio de arquivos pelo cliente.
                 ok, buf = self.camera_handler.encode_frame(frame)
                 if not ok:
                     continue
@@ -374,6 +398,7 @@ class FacialRecognitionServer:
             success = False
             if hasattr(self.face_handler, 'train_model'):
                 success = self.face_handler.train_model()
+            # Também computamos estatísticas do dataset para feedback ao usuário
             dataset_counts, total_images = self._dataset_counts()
             return {
                 "type": "model_trained",
@@ -478,7 +503,8 @@ class FacialRecognitionServer:
                 confs = result.get("confidence", [])
                 accepted_this_frame = []
 
-                # Considera apenas rótulos conhecidos com confiança abaixo do limiar
+                # Considera apenas rótulos conhecidos com confiança abaixo do limiar.
+                # Importante: no LBPH, confiança é uma "distância"; quanto MENOR, melhor.
                 for idx, name in enumerate(faces):
                     if not name or name == "Desconhecido":
                         continue
@@ -505,6 +531,7 @@ class FacialRecognitionServer:
                 time.sleep(0.15)
 
             # Decide vencedor
+            # Critério: pessoa com maior número de votos e votos >= required → acesso concedido.
             winner = None
             votes = 0
             if tallies:

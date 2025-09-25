@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """
 Handler Compatível para Reconhecimento Facial
-Módulo responsável pelo processamento de reconhecimento facial com fallback para OpenCV.
+
+Dois modos de operação:
+1) Com dlib/face_recognition instalado: usa encodings de 128-dim e comparação de distâncias.
+2) Sem dlib: usa OpenCV (Haar cascade para detecção + LBPH para reconhecimento de identidade).
+
+Por que este arquivo existe?
+- Em Windows/Python 3.13, compilar dlib pode ser complexo. Este handler mantém o sistema funcional
+    com uma alternativa pura OpenCV (via opencv-contrib), salvando dataset em disco e treinando LBPH.
+
+Layout do dataset (modo OpenCV):
+- data/<nome>/*.jpg → recortes em tons de cinza das faces capturadas durante a coleta.
+- models/opencv_lbph.xml → arquivo do modelo LBPH
+- models/lbph_labels.json → mapeamento label<->nome
+
+Limiar LBPH (LBPH_THRESHOLD):
+- Métrica de confiança do LBPH é uma distância (menor=melhor). Usamos um limiar empírico para decidir
+    se uma predição é aceita (conhecido) ou rejeitada (Desconhecido). Ajuste conforme a qualidade do dataset.
 """
 
 try:
-    import face_recognition
+    import face_recognition  # type: ignore
     FACE_RECOGNITION_AVAILABLE = True
 except ImportError:
     FACE_RECOGNITION_AVAILABLE = False
@@ -422,7 +438,7 @@ class FaceRecognitionHandler:
                     face_roi = frame[y:y+h, x:x+w]
                     gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
                     label, confidence = self.recognizer.predict(gray)
-                    # Menor 'confidence' => melhor; limiar empírico
+                    # Menor 'confidence' => melhor; limiar empírico (lbph_threshold)
                     threshold = getattr(self, 'lbph_threshold', 70.0)
                     if confidence <= threshold and label in self.label_to_name:
                         name = self.label_to_name[label]
