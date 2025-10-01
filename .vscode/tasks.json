@@ -202,6 +202,29 @@
 			],
 			"isBackground": false,
 			"group": "test"
+		},
+		{
+			"label": "📦 Instalar Dependências (pip)",
+			"type": "shell",
+			"command": "pip",
+			"args": [
+				"install",
+				"-r",
+				"requirements.txt"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "🔎 Verificar Python e OpenCV",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-c",
+				"import sys; print(sys.executable); print(sys.version); import cv2; print('cv2:', cv2.__version__)"
+			],
+			"isBackground": false,
+			"group": "test"
 		}
 	]
 }
