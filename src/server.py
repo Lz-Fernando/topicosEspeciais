@@ -21,6 +21,7 @@ Por que LBPH?:
   especialmente em ambientes sem GPU/dlib. Sua métrica de confiança é "distância": quanto MENOR, melhor.
 """
 
+import cv2
 import socket
 import threading
 import logging
@@ -43,6 +44,10 @@ from config import (
     CAMERA_INDEX,
     camera_resolution,
     LBPH_THRESHOLD,
+    LBPH_STRICT_ENABLE,
+    LBPH_STRICT_THRESHOLD,
+    LBPH_STRICT_MAX_DISTANCE,
+    LBPH_MIN_VOTES_STRICT,
 )
 
 
@@ -67,10 +72,11 @@ class FacialRecognitionServer:
         self.is_running = False
         
         # Handlers especializados
-        self.face_handler = FaceRecognitionHandler()
         if resolution is None:
             resolution = camera_resolution()
         self.camera_handler = CameraHandler(camera_index=camera_index, resolution=resolution)
+        # Handler facial (LBPH apenas)
+        self.face_handler = FaceRecognitionHandler()
         
         # Controle de conexões ativas
         self.active_connections: Dict[str, socket.socket] = {}
@@ -247,7 +253,63 @@ class FacialRecognitionServer:
             return self._handle_collect_dataset(message)
 
         elif message_type == "authorize_access":
-            return self._handle_authorize_access(message)
+            count = int(message.get("count", 3))
+            required = int(message.get("required", 2))
+            threshold = float(message.get("threshold", LBPH_THRESHOLD))
+            # (opcional) whitelist futura: allowed = set(message.get("allowed", []))
+
+            frame_results = []
+            vote_counter: dict[str, int] = {}
+
+            for i in range(count):
+                frame = self.camera_handler.capture_frame()
+                if frame is None:
+                    frame_results.append({"error": "frame_fail"})
+                    continue
+                preds = self.face_handler.predict(frame)
+                # Ajustar threshold em tempo de execução (ex: override local)
+                for p in preds:
+                    # Se veio sem confidence (modelo não treinado) ou acima do limiar => ignora
+                    if p.get("confidence") is None:
+                        continue
+                    if p["name"] == "Desconhecido":
+                        continue
+                    # Voto só conta se o nome reconhecido passou pelo limiar no handler
+                    vote_counter[p["name"]] = vote_counter.get(p["name"], 0) + 1
+                frame_results.append({"predictions": preds})
+
+            # Decide vencedor
+            granted = False
+            best_name = None
+            best_votes = 0
+            if vote_counter:
+                best_name, best_votes = max(vote_counter.items(), key=lambda kv: kv[1])
+                if best_votes >= required:
+                    granted = True
+
+            # Se ninguém reconhecido (ou não atingiu votos), acesso negado
+            response = {
+                "type": "access_decision",
+                "granted": granted,
+                "name": best_name if granted else None,
+                "votes": best_votes,
+                "required": required,
+                "count": count,
+                "threshold": threshold,
+                "tallies": vote_counter,
+                "frames": frame_results,
+            }
+
+            # Snapshot opcional (último frame válido)
+            if frame is not None:
+                try:
+                    ok, jpg = cv2.imencode(".jpg", frame)
+                    if ok:
+                        response["image_data"] = base64.b64encode(jpg.tobytes()).decode("ascii")
+                except Exception:
+                    pass
+
+            return response
 
         elif message_type == "ping":
             return {
@@ -445,17 +507,30 @@ class FacialRecognitionServer:
                 }
 
             if hasattr(self.face_handler, 'predict'):
-                result = self.face_handler.predict(frame)
+                result = self.face_handler.predict(frame)  # lista de dicts
             else:
+                # Fallback teórico (não deve ocorrer mais)
                 result = self.face_handler.recognize_faces(frame)
 
             _, buffer = self.camera_handler.encode_frame(frame)
             image_data = base64.b64encode(buffer).decode('utf-8')
-
+            if isinstance(result, list):
+                recognized_faces = [p.get("name", "Desconhecido") for p in result]
+                confidence_scores = [p.get("confidence") for p in result]
+                return {
+                    "type": "prediction_result",
+                    "recognized_faces": recognized_faces,
+                    "confidence_scores": confidence_scores,
+                    "raw": result,
+                    "image_data": image_data,
+                    "timestamp": time.time()
+                }
+            # Compat se ainda for dict (estrutura antiga)
             return {
                 "type": "prediction_result",
                 "recognized_faces": result.get("faces", []),
                 "confidence_scores": result.get("confidence", []),
+                "raw": result,
                 "image_data": image_data,
                 "timestamp": time.time()
             }
@@ -479,78 +554,84 @@ class FacialRecognitionServer:
             count = int(message.get("count", 3))
             required = int(message.get("required", 2))
             threshold = float(message.get("threshold", LBPH_THRESHOLD))
-            if count <= 0 or required <= 0 or required > count:
-                return {"type": "error", "message": "Parâmetros inválidos (count/required)", "timestamp": time.time()}
+            # (opcional) whitelist futura: allowed = set(message.get("allowed", []))
 
-            tallies: Dict[str, int] = {}
-            frames_details = []
-            last_image_b64 = None
+            effective_threshold = threshold if threshold is not None else self.face_handler.lbph_threshold
+            frame_results = []
+            vote_counter: dict[str, int] = {}
+            last_frame = None
+            # Para métricas de distância por identidade
+            distance_tracker: dict[str, list[float]] = {}
 
             for i in range(count):
                 frame = self.camera_handler.capture_frame()
+                last_frame = frame if frame is not None else last_frame
                 if frame is None:
-                    frames_details.append({"error": "Falha captura"})
-                    time.sleep(0.1)
+                    frame_results.append({"error": "frame_fail"})
                     continue
-
-                # Executa predição
-                if hasattr(self.face_handler, 'predict'):
-                    result = self.face_handler.predict(frame)
-                else:
-                    result = self.face_handler.recognize_faces(frame)
-
-                faces = result.get("faces", [])
-                confs = result.get("confidence", [])
-                accepted_this_frame = []
-
-                # Considera apenas rótulos conhecidos com confiança abaixo do limiar.
-                # Importante: no LBPH, confiança é uma "distância"; quanto MENOR, melhor.
-                for idx, name in enumerate(faces):
-                    if not name or name == "Desconhecido":
+                preds = self.face_handler.predict(frame)
+                for p in preds:
+                    if p.get("name") == "Desconhecido":
                         continue
-                    conf = None
-                    if idx < len(confs):
-                        try:
-                            conf = float(confs[idx])
-                        except Exception:
-                            conf = None
-                    if conf is not None and conf <= threshold:
-                        tallies[name] = tallies.get(name, 0) + 1
-                        accepted_this_frame.append({"name": name, "confidence": conf})
+                    dist = p.get("distance") or p.get("confidence")
+                    if dist is None:
+                        continue  # modelo não treinado
+                    if dist > effective_threshold:
+                        continue  # rejeita acima do limiar principal
+                    name = p["name"]
+                    vote_counter[name] = vote_counter.get(name, 0) + 1
+                    distance_tracker.setdefault(name, []).append(dist)
+                frame_results.append({"predictions": preds})
 
-                # Codifica último frame para retorno
-                _, buffer = self.camera_handler.encode_frame(frame)
-                last_image_b64 = base64.b64encode(buffer).decode('utf-8')
+            granted = False
+            best_name = None
+            best_votes = 0
+            if vote_counter:
+                best_name, best_votes = max(vote_counter.items(), key=lambda kv: kv[1])
+                if best_votes >= required:
+                    granted = True
 
-                frames_details.append({
-                    "faces": faces,
-                    "confidences": confs,
-                    "accepted": accepted_this_frame,
-                })
+            strict_info = None
+            if granted and LBPH_STRICT_ENABLE and best_name in distance_tracker:
+                dists = distance_tracker[best_name]
+                avg_dist = sum(dists) / len(dists)
+                max_dist = max(dists)
+                strict_info = {
+                    "avg_distance": avg_dist,
+                    "max_distance": max_dist,
+                    "count_samples": len(dists),
+                    "strict_threshold": LBPH_STRICT_THRESHOLD,
+                    "strict_max_distance": LBPH_STRICT_MAX_DISTANCE,
+                }
+                # Aplicar regras estritas: média e máximo devem estar abaixo dos limiares
+                if avg_dist > LBPH_STRICT_THRESHOLD or max_dist > LBPH_STRICT_MAX_DISTANCE:
+                    granted = False
+                # Também podemos exigir um número mínimo de votos em modo estrito
+                elif best_votes < max(required, LBPH_MIN_VOTES_STRICT):
+                    granted = False
 
-                time.sleep(0.15)
-
-            # Decide vencedor
-            # Critério: pessoa com maior número de votos e votos >= required → acesso concedido.
-            winner = None
-            votes = 0
-            if tallies:
-                winner, votes = max(tallies.items(), key=lambda kv: kv[1])
-            granted = bool(winner and votes >= required)
-
-            return {
+            response = {
                 "type": "access_decision",
                 "granted": granted,
-                "name": winner,
-                "votes": votes,
+                "name": best_name if granted else None,
+                "votes": best_votes,
                 "required": required,
                 "count": count,
-                "threshold": threshold,
-                "tallies": tallies,
-                "frames": frames_details,
-                "image_data": last_image_b64,
-                "timestamp": time.time(),
+                "threshold": effective_threshold,
+                "tallies": vote_counter,
+                "frames": frame_results,
+                "strict": strict_info,
             }
+
+            if last_frame is not None:
+                try:
+                    ok, jpg = cv2.imencode(".jpg", last_frame)
+                    if ok:
+                        response["image_data"] = base64.b64encode(jpg.tobytes()).decode("ascii")
+                except Exception:
+                    pass
+
+            return response
         except Exception as e:
             self.logger.error(f"Erro em authorize_access: {e}")
             return {

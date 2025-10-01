@@ -127,34 +127,55 @@ class FaceRecognitionHandler:
     def train_model(self) -> bool:
         return self._train_lbph_from_dataset()
 
-    def predict(self, frame: np.ndarray) -> Dict[str, Any]:
-        face_coords = self._detect_faces(frame)
-        faces_found: List[str] = []
-        confidence_scores: List[float] = []
-        face_coordinates: List[Dict[str, int]] = []
-        for x, y, w, h in face_coords:
+    def predict(self, frame: np.ndarray) -> list[dict]:
+        """
+        Executa detecção e tentativa de identificação.
+        Retorna lista de dicts: {name, confidence, bbox}
+        - name = 'Desconhecido' se distância > limiar ou modelo não treinado.
+        """
+        results: list[dict] = []
+        if frame is None:
+            return results
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(60, 60))
+
+        for (x, y, w, h) in faces:
+            roi = gray[y:y + h, x:x + w]
             name = "Desconhecido"
-            score_out = 0.0
-            if self.recognizer is not None and self.label_to_name:
+            confidence = None
+            distance = None
+            if self._is_trained():
                 try:
-                    roi = frame[y:y+h, x:x+w]
-                    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                    label, dist = self.recognizer.predict(gray)
-                    if dist <= self.lbph_threshold and label in self.label_to_name:
-                        name = self.label_to_name[label]
-                        score_out = dist  # retornamos a distância direta; cliente decide uso
+                    pred_label, dist = self.recognizer.predict(roi)
+                    distance = float(dist)
+                    confidence = distance  # mantemos chave 'confidence' como distância bruta (compat)
+                    label_name = self._label_name(pred_label)
+                    # Regra de aceitação: distância <= limiar E label conhecido
+                    if label_name is not None and distance <= self.lbph_threshold:
+                        name = label_name
                 except Exception as e:
-                    self.logger.error(f"Predição LBPH falhou: {e}")
-            faces_found.append(name)
-            confidence_scores.append(float(score_out))
-            face_coordinates.append({'top': y, 'right': x + w, 'bottom': y + h, 'left': x})
-        return {
-            'faces': faces_found,
-            'confidence': confidence_scores,
-            'coordinates': face_coordinates,
-            'total_faces': len(faces_found)
-        }
-        
+                    self.logger.error(f"Erro na predição LBPH: {e}")
+
+            results.append({
+                "name": name,
+                "confidence": confidence,
+                "bbox": (int(x), int(y), int(w), int(h)),
+                "distance": distance,
+            })
+        return results
+
+    def _label_name(self, idx: int) -> str | None:
+        # Usa mapeamento label_to_name carregado do modelo
+        return self.label_to_name.get(idx)
+
+    def _is_trained(self) -> bool:
+        return (
+            self.recognizer is not None
+            and bool(self.label_to_name)
+            and os.path.exists(self.lbph_model_file)
+        )
+
     # ===== Utilidades =====
         
     def draw_face_rectangles(self, frame: np.ndarray, result: Dict[str, Any]) -> np.ndarray:
