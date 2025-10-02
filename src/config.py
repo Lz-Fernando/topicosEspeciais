@@ -19,7 +19,7 @@ except Exception:
 
 
 # Redes
-SERVER_HOST: str = os.getenv("SERVER_HOST", "localhost")
+SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8888"))
 MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "5"))
 
